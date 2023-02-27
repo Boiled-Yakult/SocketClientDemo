@@ -40,6 +40,8 @@ namespace SocketClientDemo
 
         private volatile bool Stopflag = false;  //收发标志  --  加入 volatile 修饰符保证不被优化掉
 
+        IPEndPoint serverEndPoint = null;
+
         #endregion
 
         #region 发送线程，接收线程,心跳检测线程
@@ -66,41 +68,56 @@ namespace SocketClientDemo
         private void CreateSocketConnection()
         {
             int countOfServers = dt_ServerInfo.Rows.Count;
+            Socket serverSocket = null;
+
             for (int i = 0; i < countOfServers; i++)
             {
-                Socket serverSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                IPEndPoint serverEndPoint = new IPEndPoint(IPAddress.Parse(dt_ServerInfo.Rows[i]["serverIP"].ToString()),
-                                                                int.Parse(dt_ServerInfo.Rows[i]["serverPort"].ToString()));
                 try
                 {
-                    IAsyncResult result = serverSocket.BeginConnect(serverEndPoint, null, null);
-                    result.AsyncWaitHandle.WaitOne(500);
-                    clientsockets.Add(serverSocket);
-                    socketClients.TryAdd(serverSocket.RemoteEndPoint.ToString(), serverSocket);
+                    serverSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                    serverEndPoint = new IPEndPoint(IPAddress.Parse(dt_ServerInfo.Rows[i]["serverIP"].ToString()),
+                                                                   int.Parse(dt_ServerInfo.Rows[i]["serverPort"].ToString()));
+                    serverSocket.BeginConnect(serverEndPoint, new AsyncCallback(ConnectCallBack), serverSocket);
                 }
-                catch (SocketException) //尝试访问套接字时出错
+                catch (Exception)
                 {
-                    Thread thr_connect = new Thread(() =>
-                      {
-                          try
-                          {
-                              for (int j = 0; j < 10; j++)
-                              {
-                                  //serverSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                                  serverSocket.Connect(serverEndPoint);
-                                  DateTime now = DateTime.Now;
-                                  while (now.AddSeconds(5) > DateTime.Now) { }
-                                  break;
-                              }
-                              clientsockets.Add(serverSocket);
-                              socketClients.TryAdd(serverSocket.RemoteEndPoint.ToString(), serverSocket);
-                              Thread.CurrentThread.Abort();
-                          }
-                          catch { }
-                      });
-                    thr_connect.IsBackground = true;
-                    thr_connect.Start();
+                    continue;
                 }
+            }
+
+        }
+
+        private void ConnectCallBack(IAsyncResult asyncResult)
+        {
+            Socket tempSocket = (Socket)asyncResult.AsyncState;
+            try
+            {
+                tempSocket.EndConnect(asyncResult);
+                socketClients.TryAdd(tempSocket.RemoteEndPoint.ToString(), tempSocket);
+            }
+            catch (Exception)
+            {
+                Thread thr_connect = new Thread(() =>
+                {
+                    bool isConnected = false;
+                    IPEndPoint temppoint = serverEndPoint;
+                    do
+                    {
+                        tempSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                        try
+                        {
+                            tempSocket.Connect(temppoint);
+                            isConnected = true;
+                            socketClients.TryAdd(tempSocket.RemoteEndPoint.ToString(), tempSocket);
+                        }
+                        catch (Exception)
+                        {
+                            continue;
+                        }
+                    } while (!isConnected);
+                });
+                thr_connect.IsBackground = true;
+                thr_connect.Start();
             }
         }
 
@@ -130,58 +147,51 @@ namespace SocketClientDemo
             {
                 if (!Stopflag)
                 {
-                    try
+                    foreach (var item in socketClients)
                     {
-                        foreach (var item in socketClients)
+                        string serverInfo = item.Key.ToString();
+                        DataRow[] drs = dt_ServerInfo.Select($"ServerIp = '{serverInfo.Split(':')[0]}' And ServerPort = '{serverInfo.Split(':')[1]}'");
+                        byte[] sendByte = hexStringToByteArray(drs[0]["Command"].ToString());
+                        try
                         {
-                            string serverInfo = item.Key.ToString();
-                            DataRow[] drs = dt_ServerInfo.Select($"ServerIp = '{serverInfo.Split(':')[0]}' And ServerPort = '{serverInfo.Split(':')[1]}'");
-                            byte[] sendByte = hexStringToByteArray(drs[0]["Command"].ToString());
-                            try
-                            {
-                                IAsyncResult result = item.Value.BeginSend(sendByte, 0, sendByte.Length, SocketFlags.None, null, null);
-                                result.AsyncWaitHandle.WaitOne(500);
-                            }
-                            catch (SocketException) // 尝试访问套接字时出错
-                            {
-                                IPEndPoint tempEndpoint = (IPEndPoint)item.Value.RemoteEndPoint;
-                                item.Value.Shutdown(SocketShutdown.Both);
-                                item.Value.Disconnect(true);
-                                item.Value.Close();
-                                Socket tempsocket = item.Value;
-                                socketClients.TryRemove(item.Key, out tempsocket);
-
-                                Thread thr_reconnect = new Thread(() =>
-                                  {
-                                      try
-                                      {
-                                          int j = 0;
-                                          for (; j < 10; j++)
-                                          {
-                                              tempsocket.Connect(tempEndpoint);
-                                              DateTime now_temp = DateTime.Now;
-                                              while (now_temp.AddSeconds(5) > DateTime.Now) { }
-                                              break;
-                                          }
-                                          if (j != 10)
-                                          {
-                                              socketClients.TryAdd(tempsocket.RemoteEndPoint.ToString(), tempsocket);
-                                          }
-                                          Thread.CurrentThread.Abort();
-                                      }
-                                      catch { }
-                                  });
-                                thr_reconnect.IsBackground = true;
-                                thr_reconnect.Start();
-                            }
+                            item.Value.BeginSend(sendByte, 0, sendByte.Length, SocketFlags.None, new AsyncCallback(SendCallback), item.Value);
                         }
-                        DateTime now = DateTime.Now;
-                        while (now.AddSeconds(1) > DateTime.Now) { }
+                        catch (SocketException)
+                        {
+                            Thread thr_ReConnecting = new Thread(() =>
+                            {
+                                Socket client = item.Value;
+                                if (client != null && !client.Connected)
+                                {
+                                    IPEndPoint temppoint = (IPEndPoint)client.RemoteEndPoint;
+                                    socketClients.TryRemove(client.RemoteEndPoint.ToString(), out client);
+                                    client.Shutdown(SocketShutdown.Both);
+                                    client.Close();
+                                    bool isConnected = false;
+                                    do
+                                    {
+                                        try
+                                        {
+                                            Socket tempSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                                            tempSocket.Connect(temppoint);
+                                            isConnected = true;
+                                            socketClients.TryAdd(tempSocket.RemoteEndPoint.ToString(), tempSocket);
+                                        }
+                                        catch (Exception)
+                                        {
+                                            continue;
+                                        }
+
+                                    } while (!isConnected);
+                                }
+                            });
+                            thr_ReConnecting.IsBackground = true;
+                            thr_ReConnecting.Start();
+                            continue;
+                        }
                     }
-                    catch (Exception ex)
-                    {
-                        throw ex;
-                    }
+                    DateTime now = DateTime.Now;
+                    while (now.AddSeconds(1) > DateTime.Now) { }
                 }
             }
         }
@@ -193,25 +203,32 @@ namespace SocketClientDemo
             {
                 client.EndSend(asyncResult);
             }
-            catch (SocketException)
+            catch (Exception)
             {
                 Thread thr_ReConnecting = new Thread(() =>
                 {
-                    for (int j = 0; j < 30; j++)
+                    if (client != null && client.Connected)
                     {
-                        if (IsConnected(client))
+                        IPEndPoint temppoint = (IPEndPoint)client.RemoteEndPoint;
+                        socketClients.TryRemove(client.RemoteEndPoint.ToString(), out client);
+                        client.Shutdown(SocketShutdown.Both);
+                        bool isConnected = false;
+                        do
                         {
-                            return;
-                        }
-                        DateTime now = DateTime.Now;
-                        while (now.AddSeconds(2) > DateTime.Now) { }
+                            try
+                            {
+                                Socket tempSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                                tempSocket.Connect(temppoint);
+                                isConnected = true;
+                                socketClients.TryAdd(tempSocket.RemoteEndPoint.ToString(), tempSocket);
+                            }
+                            catch (Exception)
+                            {
+                                continue;
+                            }
+
+                        } while (!isConnected);
                     }
-                    /*--------------------30次后都连不上---------------------------*/
-                    MaterialMessageBox.Show($"IP 地址为：{client.RemoteEndPoint.ToString()} 的设备断开连接。");
-                    socketClients.TryRemove(client.RemoteEndPoint.ToString(), out client);
-                    client.Shutdown(SocketShutdown.Both);
-                    client.Close();
-                    this.Dispose();
                 });
                 thr_ReConnecting.IsBackground = true;
                 thr_ReConnecting.Start();
@@ -249,39 +266,36 @@ namespace SocketClientDemo
                         txt_ReceiveMsg.ScrollToCaret();
                     }));
                 }
-                else
-                {
-                    Thread.CurrentThread.Abort();
-                }
+
             }
-            catch (SocketException)
+            catch (Exception)
             {
                 Thread thr_ReConnecting = new Thread(() =>
-                {
-                    IPEndPoint tempEndpoint = (IPEndPoint)client.RemoteEndPoint;
-                    client.Shutdown(SocketShutdown.Both);
-                    client.Disconnect(true);
-                    client.Close();
-                    Socket tempsocket = client;
-                    socketClients.TryRemove(client.RemoteEndPoint.ToString(), out tempsocket);
-                    try
-                    {
-                        int j = 0;
-                        for (; j < 10; j++)
-                        {
-                            tempsocket.Connect(tempEndpoint);
-                            DateTime now_temp = DateTime.Now;
-                            while (now_temp.AddSeconds(5) > DateTime.Now) { }
-                            break;
-                        }
-                        if (j != 10)
-                        {
-                            socketClients.TryAdd(tempsocket.RemoteEndPoint.ToString(), tempsocket);
-                        }
-                        Thread.CurrentThread.Abort();
-                    }
-                    catch { }
-                });
+                  {
+                      if (client != null && client.Connected)
+                      {
+                          IPEndPoint temppoint = (IPEndPoint)client.RemoteEndPoint;
+                          socketClients.TryRemove(client.RemoteEndPoint.ToString(), out client);
+                          client.Shutdown(SocketShutdown.Both);
+                          client.Close();
+                          bool isConnected = false;
+                          do
+                          {
+                              try
+                              {
+                                  Socket tempSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                                  tempSocket.Connect(temppoint);
+                                  isConnected = true;
+                                  socketClients.TryAdd(tempSocket.RemoteEndPoint.ToString(), tempSocket);
+                              }
+                              catch (Exception)
+                              {
+                                  continue;
+                              }
+
+                          } while (!isConnected);
+                      }
+                  });
                 thr_ReConnecting.IsBackground = true;
                 thr_ReConnecting.Start();
             }
@@ -316,7 +330,7 @@ namespace SocketClientDemo
                         /*使用新的客户端资源覆盖，上一个已经废弃。如果继续使用以前的资源进行连接，
                         即使参数正确， 服务器全部打开也会无法连接*/
                         client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                        Thread.Sleep(1000);//等待1s再去重连
+                        Thread.Sleep(1000);
                     }
                 }
             });
@@ -422,59 +436,92 @@ namespace SocketClientDemo
                         foreach (var item in socketClients)
                         {
                             /*----------------------------------------------关于接收数据所用的字节数组长度，假定在实际使用时有标志来告知回数长度----------------------------*/
-                            if (item.Key.Contains("10010"))
+                            if (item.Value.Connected)
                             {
-                                item.Value.BeginReceive(ReceiveByte_HFCT, 0, ReceiveByte_HFCT.Length, SocketFlags.None, new AsyncCallback(AsyncReceiveCall), item.Value);
-                            }
-                            else
-                            {
-                                item.Value.BeginReceive(ReceiveByte_CIRC, 0, ReceiveByte_CIRC.Length, SocketFlags.None, new AsyncCallback(AsyncReceiveCall), item.Value);
+                                if (item.Key.Contains("10010"))
+                                {
+                                    item.Value.BeginReceive(ReceiveByte_HFCT, 0, ReceiveByte_HFCT.Length, SocketFlags.None, new AsyncCallback(AsyncReceiveCall), item.Value);
+                                }
+                                else
+                                {
+                                    item.Value.BeginReceive(ReceiveByte_CIRC, 0, ReceiveByte_CIRC.Length, SocketFlags.None, new AsyncCallback(AsyncReceiveCall), item.Value);
+                                }
                             }
                         }
                         DateTime now = DateTime.Now;
                         while (now.AddSeconds(2) > DateTime.Now) { }
                     }
-                    catch (ObjectDisposedException ex)  //Socket已关闭
+                    catch (Exception)  //Socket已关闭
                     {
-                        throw ex;
+                        continue;
                     }
                 }
             }
         }
-
         private void CheckAlive()
         {
-            Thread.Sleep(10000);
-            while (true)
+            //Thread.Sleep(10000);
+            //while (true)
+            //{
+            //    try
+            //    {
+            //        lock (socketClients)
+            //        {
+            //            foreach (var item in socketClients)
+            //            {
+            //                //if (item.Client.Client.Poll(500, System.Net.Sockets.SelectMode.SelectRead) && (item.Client.Client.Available == 0))
+
+            //                if (item.Value.Poll(500, System.Net.Sockets.SelectMode.SelectRead) && item.Value.Available == 0)
+            //                {
+            //                    //MaterialMessageBox.Show("未收到心跳检测回复");
+            //                    //心跳检测处理
+            //                    item.Value.Shutdown(SocketShutdown.Both);
+            //                    item.Value.Disconnect(true);
+            //                    item.Value.Close();
+            //                    Socket tempsocket = item.Value;
+            //                    socketClients.TryRemove(item.Key, out tempsocket);
+            //                }
+            //            }
+            //        }
+
+            //    }
+            //    catch (Exception e)
+            //    {
+            //        MaterialMessageBox.Show(e.ToString());
+            //    }
+            //    Thread.Sleep(500);
+            //}
+            Thread.Sleep(10000000);
+            for (int i = 0; i < dt_ServerInfo.Rows.Count; i++)
             {
-                try
+                string testEndPoint = dt_ServerInfo.Rows[i]["ServerIP"].ToString() + ":" + dt_ServerInfo.Rows[i]["ServerPort"].ToString();
+                bool isExist = false;
+                foreach (var item in socketClients)
                 {
-                    lock (socketClients)
+                    if (item.Key.Contains(testEndPoint))
                     {
-                        foreach (var item in socketClients)
-                        {
-                            //if (item.Client.Client.Poll(500, System.Net.Sockets.SelectMode.SelectRead) && (item.Client.Client.Available == 0))
-
-                            if (item.Value.Poll(500, System.Net.Sockets.SelectMode.SelectRead) && item.Value.Available == 0)
-                            {
-                                //MaterialMessageBox.Show("未收到心跳检测回复");
-                                //心跳检测处理
-                                item.Value.Shutdown(SocketShutdown.Both);
-                                item.Value.Disconnect(true);
-                                item.Value.Close();
-                                Socket tempsocket = item.Value;
-                                socketClients.TryRemove(item.Key, out tempsocket);
-                            }
-                        }
+                        isExist = true;
                     }
-
                 }
-                catch (Exception e)
+                if (isExist == false)       //如果他没有
                 {
-                    MaterialMessageBox.Show(e.ToString());
+                    do
+                    {
+                        try
+                        {
+                            Socket socekt = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                            socekt.Connect(IPAddress.Parse(dt_ServerInfo.Rows[i]["ServerIP"].ToString()), int.Parse(dt_ServerInfo.Rows[i]["ServerPort"].ToString()));
+                            socketClients.TryAdd(socekt.RemoteEndPoint.ToString(), socekt);
+                            isExist = true;
+                        }
+                        catch (Exception)
+                        {
+                            continue;
+                        }
+                    } while (!isExist);
                 }
-                Thread.Sleep(500);
             }
+
         }
 
         #endregion
@@ -515,6 +562,34 @@ namespace SocketClientDemo
                 materialButton2.Text = "Stop";
             }
 
+        }
+
+        private void ReConnceting(Socket errorsocket)
+        {
+            try
+            {
+                IPEndPoint endPoint = (IPEndPoint)errorsocket.RemoteEndPoint;
+                Socket tempsocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                errorsocket.Shutdown(SocketShutdown.Both);
+                errorsocket.Close();
+                if (socketClients.ContainsKey(endPoint.ToString()))
+                {
+                    try
+                    {
+                        socketClients.TryRemove(errorsocket.RemoteEndPoint.ToString(), out Socket Temp_socket);
+                    }
+                    catch (Exception) { }
+                }
+                DateTime now = DateTime.Now;
+                while (now.AddSeconds(3) > DateTime.Now) { }
+                tempsocket.Connect(endPoint);
+                if (tempsocket.Connected)
+                {
+                    socketClients.TryAdd(tempsocket.RemoteEndPoint.ToString(), tempsocket);
+                }
+            }
+            catch (SocketException)
+            { }
         }
     }
 }
