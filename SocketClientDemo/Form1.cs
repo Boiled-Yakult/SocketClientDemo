@@ -15,6 +15,7 @@ using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Diagnostics;
 using System.Collections;
+using System.IO;
 
 namespace SocketClientDemo
 {
@@ -95,8 +96,9 @@ namespace SocketClientDemo
                 tempSocket.EndConnect(asyncResult);
                 socketClients.TryAdd(tempSocket.RemoteEndPoint.ToString(), tempSocket);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                WriteLog(ex);
                 Thread thr_connect = new Thread(() =>
                 {
                     bool isConnected = false;
@@ -203,8 +205,9 @@ namespace SocketClientDemo
             {
                 client.EndSend(asyncResult);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                WriteLog(ex);
                 Thread thr_ReConnecting = new Thread(() =>
                 {
                     if (client != null && client.Connected)
@@ -268,8 +271,9 @@ namespace SocketClientDemo
                 }
 
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                WriteLog(ex);
                 Thread thr_ReConnecting = new Thread(() =>
                   {
                       if (client != null && client.Connected)
@@ -460,37 +464,6 @@ namespace SocketClientDemo
         }
         private void CheckAlive()
         {
-            //Thread.Sleep(10000);
-            //while (true)
-            //{
-            //    try
-            //    {
-            //        lock (socketClients)
-            //        {
-            //            foreach (var item in socketClients)
-            //            {
-            //                //if (item.Client.Client.Poll(500, System.Net.Sockets.SelectMode.SelectRead) && (item.Client.Client.Available == 0))
-
-            //                if (item.Value.Poll(500, System.Net.Sockets.SelectMode.SelectRead) && item.Value.Available == 0)
-            //                {
-            //                    //MaterialMessageBox.Show("未收到心跳检测回复");
-            //                    //心跳检测处理
-            //                    item.Value.Shutdown(SocketShutdown.Both);
-            //                    item.Value.Disconnect(true);
-            //                    item.Value.Close();
-            //                    Socket tempsocket = item.Value;
-            //                    socketClients.TryRemove(item.Key, out tempsocket);
-            //                }
-            //            }
-            //        }
-
-            //    }
-            //    catch (Exception e)
-            //    {
-            //        MaterialMessageBox.Show(e.ToString());
-            //    }
-            //    Thread.Sleep(500);
-            //}
             Thread.Sleep(10000000);
             for (int i = 0; i < dt_ServerInfo.Rows.Count; i++)
             {
@@ -562,6 +535,24 @@ namespace SocketClientDemo
                 materialButton2.Text = "Stop";
             }
 
+        }
+
+        private static void WriteLog(Exception ex)
+        {
+            string strDataInfo = "程序异常：" + DateTime.Now + "\r\n";
+            string strException = string.Format(strDataInfo + $"异常类型：{ex.GetType().Name}\r\n" +
+                $"异常消息：{ex.Message}\r\n+" +
+                $"异常信息：{ex.StackTrace}");
+            //默认存储路径为Debug目录下的ErrLog文件夹
+            if (!Directory.Exists("ErrLog"))
+            {
+                Directory.CreateDirectory("ErrLog");
+            }
+            using (StreamWriter sw = new StreamWriter(@"ErrLog\ErrLog.txt", true))
+            {
+                sw.WriteLine(strException);
+                sw.WriteLine("---------------------------------------------------------------------");
+            }
         }
 
         private void ReConnceting(Socket errorsocket)
